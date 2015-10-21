@@ -1,14 +1,11 @@
 ﻿using System;
-using System.Configuration;
-using System.Diagnostics;
-using System.Net;
 using System.Threading;
 using ECommon.Autofac;
-using ECommon.Configurations;
+using ECommon.Components;
 using ECommon.Log4Net;
+using ECommon.Logging;
 using ECommon.Remoting;
-using ECommon.TcpTransport;
-using ECommon.Utilities;
+using ECommon.Scheduling;
 using ECommonConfiguration = ECommon.Configurations.Configuration;
 
 namespace RemotingPerformanceTest.Server
@@ -17,14 +14,6 @@ namespace RemotingPerformanceTest.Server
     {
         static void Main(string[] args)
         {
-            var socketBufferSize = int.Parse(ConfigurationManager.AppSettings["SocketBufferSize"]);
-            var setting = new Setting
-            {
-                TcpConfiguration = new TcpConfiguration
-                {
-                    SocketBufferSize = socketBufferSize
-                }
-            };
             ECommonConfiguration
                 .Create()
                 .UseAutofac()
@@ -32,34 +21,39 @@ namespace RemotingPerformanceTest.Server
                 .UseLog4Net()
                 .RegisterUnhandledExceptionHandler();
 
-            var bindingIP = ConfigurationManager.AppSettings["BindingAddress"];
-            var serverIP = string.IsNullOrEmpty(bindingIP) ? SocketUtils.GetLocalIPV4() : IPAddress.Parse(bindingIP);
-            var server = new SocketRemotingServer("Server", new IPEndPoint(serverIP, 5000));
-            server.RegisterRequestHandler(100, new RequestHandler());
-            server.Start();
+            new SocketRemotingServer().RegisterRequestHandler(100, new RequestHandler()).Start();
             Console.ReadLine();
         }
 
         class RequestHandler : IRequestHandler
         {
-            int totalHandled;
-            Stopwatch watch;
-            byte[] response = new byte[100];
+            private readonly IScheduleService _scheduleService;
+            private readonly ILogger _logger;
+            private readonly byte[] response = new byte[0];
+            private long _previusHandledCount;
+            private long _handledCount;
+
+            public RequestHandler()
+            {
+                _logger = ObjectContainer.Resolve<ILoggerFactory>().Create("RequestHandler");
+                _scheduleService = ObjectContainer.Resolve<IScheduleService>();
+                _scheduleService.StartTask("Program.PrintThroughput", PrintThroughput, 1000, 1000);
+            }
 
             public RemotingResponse HandleRequest(IRequestHandlerContext context, RemotingRequest remotingRequest)
             {
-                var local = Interlocked.Increment(ref totalHandled);
-                if (local == 1)
-                {
-                    watch = Stopwatch.StartNew();
-                }
-                if (local % 10000 == 0)
-                {
-                    Console.WriteLine("handle request, size:" + remotingRequest.Body.Length + ", count:" + local + ", timeSpent:" + watch.ElapsedMilliseconds + "ms");
-                }
-                return new RemotingResponse(10, remotingRequest.Sequence, response);
+                Interlocked.Increment(ref _handledCount);
+                return new RemotingResponse(remotingRequest.Code, 10, remotingRequest.Type, response, remotingRequest.Sequence);
+            }
+
+            private void PrintThroughput()
+            {
+                var totalHandledCount = _handledCount;
+                var throughput = totalHandledCount - _previusHandledCount;
+                _previusHandledCount = totalHandledCount;
+
+                _logger.InfoFormat("currentTime: {0}, totalReceived: {1}, throughput: {2}/s", DateTime.Now.ToLongTimeString(), totalHandledCount, throughput);
             }
         }
-
     }
 }

@@ -1,107 +1,142 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Configuration;
-using System.Diagnostics;
-using System.IO;
-using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using ECommon.Autofac;
-using ECommon.Configurations;
+using ECommon.Components;
 using ECommon.Log4Net;
+using ECommon.Logging;
 using ECommon.Remoting;
-using ECommon.TcpTransport;
-using ECommon.Utilities;
+using ECommon.Scheduling;
+using ECommon.Socketing;
 using ECommonConfiguration = ECommon.Configurations.Configuration;
 
 namespace RemotingPerformanceTest.Client
 {
     class Program
     {
-        static SocketRemotingClient _remotingClient;
+        static string _mode;
+        static int _messageCount;
+        static int _sentCount;
+        static int _previousSentCount;
+        static byte[] _message;
+        static ILogger _logger;
+        static IScheduleService _scheduleService;
+        static SocketRemotingClient _client;
 
         static void Main(string[] args)
         {
-            var maxSendPacketSize = int.Parse(ConfigurationManager.AppSettings["MaxSendPacketSize"]);
-            var socketBufferSize = int.Parse(ConfigurationManager.AppSettings["SocketBufferSize"]);
-            var setting = new Setting
-            {
-                TcpConfiguration = new TcpConfiguration
-                {
-                    MaxSendPacketSize = maxSendPacketSize,
-                    SocketBufferSize = socketBufferSize
-                }
-            };
+            InitializeECommon();
+            StartSendMessageTest();
+            StartPrintThroughputTask();
+            Console.ReadLine();
+        }
+
+        static void InitializeECommon()
+        {
             ECommonConfiguration
-                .Create(setting)
+                .Create()
                 .UseAutofac()
                 .RegisterCommonComponents()
                 .UseLog4Net()
                 .RegisterUnhandledExceptionHandler();
 
+            _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(typeof(Program).Name);
+            _scheduleService = ObjectContainer.Resolve<IScheduleService>();
+        }
+        static void StartSendMessageTest()
+        {
             var serverIP = ConfigurationManager.AppSettings["ServerAddress"];
-            var mode = ConfigurationManager.AppSettings["Mode"];
-            var ipAddress = string.IsNullOrEmpty(serverIP) ? SocketUtils.GetLocalIPV4() : IPAddress.Parse(serverIP);
-            _remotingClient = new SocketRemotingClient(new IPEndPoint(ipAddress, 5000));
-            _remotingClient.Start();
-
-            var parallelThreadCount = int.Parse(ConfigurationManager.AppSettings["ParallelThreadCount"]);
-            var actions = new List<Action>();
-            for (var i = 0; i < parallelThreadCount; i++)
-            {
-                actions.Add(() => SendMessageAsync(mode));
-            }
-
-            _watch.Start();
-            Parallel.Invoke(actions.ToArray());
-            Console.ReadLine();
-        }
-
-        static void SendMessageAsync(string mode)
-        {
-            Console.WriteLine("----SendMessageAsync Test----");
-
+            var serverAddress = string.IsNullOrEmpty(serverIP) ? SocketUtils.GetLocalIPV4() : IPAddress.Parse(serverIP);
             var messageSize = int.Parse(ConfigurationManager.AppSettings["MessageSize"]);
-            var messageCount = int.Parse(ConfigurationManager.AppSettings["MessageCount"]);
-            var message = new byte[messageSize];
 
-            if (mode == "Oneway")
+            _message = new byte[messageSize];
+            _mode = ConfigurationManager.AppSettings["Mode"];
+            _messageCount = int.Parse(ConfigurationManager.AppSettings["MessageCount"]);
+
+            _client = new SocketRemotingClient(new IPEndPoint(serverAddress, 5000)).Start();
+
+            var sendAction = default(Action);
+
+            if (_mode == "Oneway")
             {
-                for (var i = 1; i <= messageCount; i++)
+                sendAction = () =>
                 {
-                    _remotingClient.InvokeOneway(new RemotingRequest(100, message));
-                }
+                    _client.InvokeOneway(new RemotingRequest(100, _message));
+                    Interlocked.Increment(ref _sentCount);
+                };
             }
-            else if (mode == "Async")
+            else if (_mode == "Sync")
             {
-                for (var i = 1; i <= messageCount; i++)
+                sendAction = () =>
                 {
-                    _remotingClient.InvokeAsync(new RemotingRequest(100, message), 200000).ContinueWith(SendCallback);
-                }
+                    _client.InvokeSync(new RemotingRequest(100, _message), 5000);
+                    Interlocked.Increment(ref _sentCount);
+                };
+            }
+            else if (_mode == "Async")
+            {
+                sendAction = () => _client.InvokeAsync(new RemotingRequest(100, _message), 100000).ContinueWith(t =>
+                {
+                    if (t.Exception != null)
+                    {
+                        _logger.Error(t.Exception);
+                        return;
+                    }
+                    if (t.Result.Code <= 0)
+                    {
+                        _logger.Error(Encoding.UTF8.GetString(t.Result.Body));
+                        return;
+                    }
+                    Interlocked.Increment(ref _sentCount);
+                });
+            }
+            else if (_mode == "Callback")
+            {
+                _client.RegisterResponseHandler(100, new ResponseHandler());
+                sendAction = () => _client.InvokeWithCallback(new RemotingRequest(100, _message));
             }
 
+            Task.Factory.StartNew(() =>
+            {
+                for (var i = 0; i < _messageCount; i++)
+                {
+                    try
+                    {
+                        sendAction();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.ErrorFormat("Send remoting request failed, errorMsg:{0}", ex.Message);
+                        Thread.Sleep(3000);
+                    }
+                }
+            });
+        }
+        static void StartPrintThroughputTask()
+        {
+            _scheduleService.StartTask("Program.PrintThroughput", PrintThroughput, 1000, 1000);
+        }
+        static void PrintThroughput()
+        {
+            var totalSent = _sentCount;
+            var throughput = totalSent - _previousSentCount;
+            _previousSentCount = totalSent;
+            _logger.InfoFormat("Send message mode: {0}, currentTime: {1}, totalSent: {2}, throughput: {3}/s", _mode, DateTime.Now.ToLongTimeString(), totalSent, throughput);
         }
 
-        static long _sentCount = 0L;
-        static Stopwatch _watch = new Stopwatch();
-        static void SendCallback(Task<RemotingResponse> task)
+        class ResponseHandler : IResponseHandler
         {
-            if (task.Exception != null)
+            public void HandleResponse(RemotingResponse remotingResponse)
             {
-                Console.WriteLine(task.Exception);
-                return;
-            }
-            if (task.Result.Code == 0)
-            {
-                Console.WriteLine(Encoding.UTF8.GetString(task.Result.Body));
-                return;
-            }
-            var current = Interlocked.Increment(ref _sentCount);
-            if (current % 10000 == 0)
-            {
-                Console.WriteLine("Sent {0} messages, timeSpent: {1}ms", current, _watch.ElapsedMilliseconds);
+                if (remotingResponse.Code <= 0)
+                {
+                    _logger.Error(Encoding.UTF8.GetString(remotingResponse.Body));
+                    return;
+                }
+                Interlocked.Increment(ref _sentCount);
             }
         }
     }

@@ -5,67 +5,86 @@ using System.Text;
 using ECommon.Components;
 using ECommon.Logging;
 using ECommon.Socketing;
-using ECommon.TcpTransport;
+using ECommon.Socketing.BufferManagement;
 
 namespace ECommon.Remoting
 {
     public class SocketRemotingServer
     {
-        private readonly TcpServerListener _serverListener;
+        private readonly ServerSocket _serverSocket;
         private readonly Dictionary<int, IRequestHandler> _requestHandlerDict;
+        private readonly IBufferPool _receiveDataBufferPool;
         private readonly ILogger _logger;
+        private readonly SocketSetting _setting;
+        private bool _isShuttingdown = false;
 
-        public SocketRemotingServer(string name, IPEndPoint serverEndPoint, ISocketServerEventListener eventListener = null)
+        public SocketRemotingServer() : this("Server", new IPEndPoint(SocketUtils.GetLocalIPV4(), 5000)) { }
+        public SocketRemotingServer(string name, IPEndPoint listeningEndPoint, SocketSetting setting = null)
         {
-            _serverListener = new TcpServerListener(serverEndPoint, eventListener, HandleRemotingRequest);
+            _setting = setting ?? new SocketSetting();
+            _receiveDataBufferPool = new BufferPool(_setting.ReceiveDataBufferSize, _setting.ReceiveDataBufferPoolSize);
+            _serverSocket = new ServerSocket(listeningEndPoint, _setting, _receiveDataBufferPool, HandleRemotingRequest);
             _requestHandlerDict = new Dictionary<int, IRequestHandler>();
-            _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(name ?? GetType().FullName);
+            _logger = ObjectContainer.Resolve<ILoggerFactory>().Create(name ?? GetType().Name);
         }
 
-        public void Start()
+        public SocketRemotingServer RegisterConnectionEventListener(IConnectionEventListener listener)
         {
-            _serverListener.Start();
+            _serverSocket.RegisterConnectionEventListener(listener);
+            return this;
         }
-        public void Shutdown()
+        public SocketRemotingServer Start()
         {
-            _serverListener.Stop();
+            _isShuttingdown = false;
+            _serverSocket.Start();
+            return this;
         }
-
-        public void RegisterRequestHandler(int requestCode, IRequestHandler requestHandler)
+        public SocketRemotingServer Shutdown()
+        {
+            _isShuttingdown = true;
+            _serverSocket.Shutdown();
+            return this;
+        }
+        public SocketRemotingServer RegisterRequestHandler(int requestCode, IRequestHandler requestHandler)
         {
             _requestHandlerDict[requestCode] = requestHandler;
+            return this;
         }
 
         private void HandleRemotingRequest(ITcpConnection connection, byte[] message, Action<byte[]> sendReplyAction)
         {
+            if (_isShuttingdown) return;
+
             var remotingRequest = RemotingUtil.ParseRequest(message);
             var requestHandlerContext = new SocketRequestHandlerContext(connection, sendReplyAction);
 
             IRequestHandler requestHandler;
             if (!_requestHandlerDict.TryGetValue(remotingRequest.Code, out requestHandler))
             {
-                var errorMessage = string.Format("No request handler found for remoting request, request code:{0}", remotingRequest.Code);
+                var errorMessage = string.Format("No request handler found for remoting request:{0}", remotingRequest);
                 _logger.Error(errorMessage);
-                requestHandlerContext.SendRemotingResponse(new RemotingResponse(-1, remotingRequest.Sequence, Encoding.UTF8.GetBytes(errorMessage)));
+                if (remotingRequest.Type != RemotingRequestType.Oneway)
+                {
+                    requestHandlerContext.SendRemotingResponse(new RemotingResponse(remotingRequest.Code, -1, remotingRequest.Type, Encoding.UTF8.GetBytes(errorMessage), remotingRequest.Sequence));
+                }
                 return;
             }
 
             try
             {
-                _logger.DebugFormat("Handling remoting request, request code:{0}, request sequence:{1}", remotingRequest.Code, remotingRequest.Sequence);
                 var remotingResponse = requestHandler.HandleRequest(requestHandlerContext, remotingRequest);
-                if (!remotingRequest.IsOneway && remotingResponse != null)
+                if (remotingRequest.Type != RemotingRequestType.Oneway && remotingResponse != null)
                 {
                     requestHandlerContext.SendRemotingResponse(remotingResponse);
                 }
             }
             catch (Exception ex)
             {
-                var errorMessage = string.Format("Exception raised when handling remoting request, request code:{0}.", remotingRequest.Code);
+                var errorMessage = string.Format("Unknown exception raised when handling remoting request:{0}.", remotingRequest);
                 _logger.Error(errorMessage, ex);
-                if (!remotingRequest.IsOneway)
+                if (remotingRequest.Type != RemotingRequestType.Oneway)
                 {
-                    requestHandlerContext.SendRemotingResponse(new RemotingResponse(-1, remotingRequest.Sequence, Encoding.UTF8.GetBytes(ex.Message)));
+                    requestHandlerContext.SendRemotingResponse(new RemotingResponse(remotingRequest.Code, -1, remotingRequest.Type, Encoding.UTF8.GetBytes(ex.Message), remotingRequest.Sequence));
                 }
             }
         }
